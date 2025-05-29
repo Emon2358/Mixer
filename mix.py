@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# mix.py — Advanced Auto-Mix Script
+# mix.py — Advanced Auto-Mix Script (MP3 & M4A 対応)
 
 import glob
 import os
 from concurrent.futures import ThreadPoolExecutor
-from math import ceil
 
 import librosa
 import numpy as np
@@ -23,35 +22,36 @@ MAX_CROSSFADE_MS    = 1500           # フェード最大幅
 N_CLUSTERS          = None           # None=曲数/10 or min 2
 OUTPUT_FILE         = "mixed_auto.mp3"
 
-# ビート・オンセット検出／スペクトルピークからスタート位置を決定
 def analyze_track(path):
     y, sr = librosa.load(path, sr=None, mono=True)
     # BPM検出
-    tempo, beats = librosa.beat.beat_track(y=y, sr=sr, start_bpm=120)
-    # オンセット位置を取得 → 最初のビート位置へシフト
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, start_bpm=120)
+    # オンセット位置を取得（バックトラック有効）
     onsets = librosa.onset.onset_detect(y=y, sr=sr, backtrack=True)
     start_frame = onsets[0] if len(onsets) else 0
     start_ms = int(start_frame * (512/sr) * 1000)
-    # クロマ・トークリッチ特徴（ハーモニック距離をとるためtonnetzも取得）
+    # ハーモニック特徴量：クロマ＋Tonnetz
     chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr), axis=1)
     tonnetz = np.mean(librosa.feature.tonnetz(y=y, sr=sr), axis=1)
     feat = np.concatenate(([tempo], chroma, tonnetz))
+    # ラウドネス
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(y)
     return {
         'path':      path,
         'tempo':     tempo,
         'sr':        sr,
         'start_ms':  start_ms,
-        'loudness':  pyln.Meter(sr).integrated_loudness(y),
+        'loudness':  loudness,
         'feat':      feat
     }
 
-# 並列で全曲解析
 def load_and_analyze():
-    paths = sorted(glob.glob("*.mp3"))
+    # MP3 と M4A を両対応で読み込む
+    paths = sorted(glob.glob("*.mp3") + glob.glob("*.m4a"))
     with ThreadPoolExecutor() as exe:
         return list(tqdm(exe.map(analyze_track, paths), total=len(paths), desc="Analyzing"))
 
-# KMeansクラスタリングでテンポ帯と調性帯に分割
 def cluster_tracks(tracks):
     n = len(tracks)
     k = max(2, n//10) if N_CLUSTERS is None else N_CLUSTERS
@@ -61,7 +61,6 @@ def cluster_tracks(tracks):
         t['cluster'] = int(km.labels_[i])
     return tracks
 
-# 曲間の距離行列をもとに最適経路を貪欲に検索
 def order_tracks(tracks):
     feats = np.stack([t['feat'] for t in tracks])
     nbrs = NearestNeighbors(n_neighbors=len(tracks), metric='cosine').fit(feats)
@@ -80,12 +79,10 @@ def order_tracks(tracks):
                 break
     return order
 
-# クリップ切り出し＋時間伸縮＋ラウドネス正規化
 def make_clip(t, target_tempo=None):
     seg = AudioSegment.from_file(t['path'])
-    # 切り出し
     clip = seg[t['start_ms']: t['start_ms'] + CLIP_LENGTH_MS]
-    # Tempo stretch
+    # Tempo stretch（次トラックのテンポに合わせる）
     if target_tempo:
         rate = target_tempo / t['tempo']
         y, sr = librosa.load(t['path'], sr=None, mono=True)
@@ -97,12 +94,10 @@ def make_clip(t, target_tempo=None):
             y_ts.tobytes(), frame_rate=int(sr*rate),
             sample_width=clip.sample_width, channels=1
         )
-    # ラウドネス正規化
-    clip = effects.normalize(clip)  # RMSベースの正規化
-    meter = pyln.Meter(t['sr'])
-    y_clip = librosa.to_mono(librosa.load(t['path'], sr=t['sr'])[0])
-    loud = meter.integrated_loudness(y_clip)
-    clip = pyln.normalize.loudness(np.array(clip.get_array_of_samples()), loud, TARGET_LUFS)
+    # ラウドネス正規化（RMSベース + LUFS）
+    clip = effects.normalize(clip)
+    arr = np.array(clip.get_array_of_samples()).astype(np.float32)
+    clip = pyln.normalize.loudness(arr, t['loudness'], TARGET_LUFS)
     return clip
 
 def main():
@@ -110,12 +105,10 @@ def main():
     tracks = cluster_tracks(tracks)
     ordered = order_tracks(tracks)
 
-    # 連結＋動的クロスフェード幅
     output = AudioSegment.silent(duration=0)
     for i, t in enumerate(ordered):
         next_tempo = ordered[i+1]['tempo'] if i+1 < len(ordered) else None
         clip = make_clip(t, target_tempo=next_tempo)
-        # BPM差が小さいほど長いクロスフェードに
         fade = int(np.interp(
             abs((next_tempo or t['tempo'])-t['tempo']),
             [0, 20], [MAX_CROSSFADE_MS, MIN_CROSSFADE_MS]
