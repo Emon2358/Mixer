@@ -1,5 +1,5 @@
 # .github/workflows/mix.yml
-name: Advanced Auto Mix MP3s
+name: Advanced Auto Mix MP3 & M4A
 
 on:
   workflow_dispatch:
